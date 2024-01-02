@@ -9,5 +9,4 @@
 >>> use RTP protocol to send NAL uint on TCP connection (not support UDP yet)
 
 
-### a real rtps server normaly contains a lot of part. just like cache manager, video IDR frame pasr pps/vps/sps, RTP packet etc.
-this project contains tiny achieve of this part. it's understandable and simple 
+### this project contains a real rtps server needs part. just like cache manager, video IDR frame pasr pps/vps/sps, RTP packet etc.it's understandable and simple
