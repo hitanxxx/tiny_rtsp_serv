@@ -54,11 +54,13 @@
 
 #define EZRTSP_INIT 0x1
 
+#define RTP_MSS 1400
 
 /// @brief rtsp connection info
 typedef struct conn
 {
-    queue_t queue;
+    int use;
+    int play;
     int fd;
     evt_t * ev;
 
@@ -76,7 +78,6 @@ typedef struct conn
 
     /// channel 
     int         chn;
-    int         play;
 
     /// PTS record 
     int         rtp_seq;
@@ -85,14 +86,14 @@ typedef struct conn
 } rtsp_con_t;
 
 static int g_listen_fd = 0;
-static queue_t g_queue_con;
 
 static pthread_t ez_rtsp_task_pid;
 static int ez_rtsp_stat = 0;
 
 static pthread_t ez_rtp_task_pid;
-static pthread_t ez_rtp_task_pid_sub;
 static int ez_rtp_stat = 0;
+
+static rtsp_con_t * con_arr = NULL;
 
 
 /// data for storge video paramsets data: pps/vps/sps etc
@@ -228,6 +229,30 @@ int ezrtsp_video_paramset_get( int chn, char * vps, int *vpsn, char * sps, int *
 
 int ezrtsp_video_paramset_save( int chn, struct video_stream * stream )
 {
+
+#if(0)
+    /// try get nal uint count int here
+    if( chn == 0 ) {
+        int naln = 0;
+        int i = 0;
+        char * p = NULL;
+        for( i = 0; i < stream->len; i++) {
+            p = (char*)(stream->data + i);
+
+            if( ((i + 3) < stream->len) && (*p == 0x00) && ( *(p+1) == 0x00) && ( *(p+2) == 0x01) ) {
+                naln++;
+                i+=3;
+            }
+            if( ((i + 4) < stream->len) && (*p == 0x00) && ( *(p+1) == 0x00) && ( *(p+2) == 0x00) && ( *(p+3) == 0x01) ) {
+                naln++;
+                i+=4;
+            }
+        }
+        dbg("chn 0 frame i [%s]. naln [%d]\n", stream->frame_type == FRAME_TYPE_I ? "yes" : "no", naln );
+    }
+#endif
+
+
     /// save info
     if( g_ps_stat[chn] == 0 ) {
         if( stream->frame_type == FRAME_TYPE_I ) {
@@ -249,7 +274,7 @@ int ezrtsp_video_paramset_save( int chn, struct video_stream * stream )
                 nlen = nal_end - nal_start;
 
                 if( video_get_enctype() == 1 ) {
-                    /// h265 
+                    /// find VPS, SPS, PPS info form H265 iframe 
                     int nalu_type = (nal_start[0]>>1) & 0x3f;
                     if ( nalu_type == 32 ) {
                         /// iframe nal uint type VPS
@@ -286,6 +311,7 @@ int ezrtsp_video_paramset_save( int chn, struct video_stream * stream )
                         }
                     }
                 } else {
+                    /// find SPS, PPS form H264 iframe 
                     int nalu_type = nal_start[0]&0x1f;
                     
                     if( nalu_type == 7 ) {
@@ -315,13 +341,11 @@ int ezrtsp_video_paramset_save( int chn, struct video_stream * stream )
                 
                 nal_start = nal_end;
             } 
-            g_ps_stat[chn] = 1;       
+            g_ps_stat[chn] = 1;
         }
     }
     return 0;
 }
-
-
 
 
 int ezrtp_packet_send( int fd, char * data, int len )
@@ -333,11 +357,11 @@ int ezrtp_packet_send( int fd, char * data, int len )
         int rc = send( fd, data + sendn, len - sendn, 0 );
         if( rc < 0 ) {
             if( errno == EAGAIN ) {
-                //err("rtp send EAGAIN, continue\n");
                 sys_msleep(5);
                 tryn++;
-                if( tryn >= 5 ) {
-                    err("EAGAIN too much times\n");
+                if( tryn >= 8 ) {
+                    ///drop the packet if failure times more than 8
+                    err("rtp send EAGAIN. tryn [%d]\n", tryn );
                     return -1;
                 }
                 continue;
@@ -346,20 +370,20 @@ int ezrtp_packet_send( int fd, char * data, int len )
             return -1;
         }
         sendn += rc;
+        tryn = 0;
     }
     return 0;
 }
 
-int ezrtp_packet_build( rtsp_con_t * c, int payload, const char * data, int size, int marker, unsigned long long ts )
+int ezrtp_packet_build( rtsp_con_t * c, int payload, const char * data, int datan, int marker, unsigned long long ts )
 {
     char rtp_packet[1500] = {0};
 
     if(1) {
         /// RTP over tcp, (RTSP Interleaved Frame)
-        /// | char | char | short |
         rtp_packet[0] = '$';                      // 0x24
         rtp_packet[1] = 0x00;                     // 0x00 
-        PUT_16( rtp_packet + 2, (12 + size) );    // rtp data length
+        PUT_16( rtp_packet + 2, (12 + datan) );    // rtp data length
     }
 
     if( c->rtp_ts_frist == 0 ) {
@@ -372,49 +396,51 @@ int ezrtp_packet_build( rtsp_con_t * c, int payload, const char * data, int size
     rtp_hdr[0] = 2 << 6;   // fixeds
     rtp_hdr[1] = (payload &0x7f) | ((marker&0x01)<<7); // fixed
     PUT_16( rtp_hdr + 2, c->rtp_seq );  /// sequence
-    PUT_32( rtp_hdr + 4, ts - c->rtp_ts_frist ); // PTS
+    //PUT_32( rtp_hdr + 4, ts - c->rtp_ts_frist ); // PTS
+    PUT_32( rtp_hdr + 4, ts ); // PTS
     PUT_32( rtp_hdr + 8, 0x252525 );  /// SSRC
 
     /// RTP payload 
-    memcpy( (rtp_packet + 12 + 4), data, size );
+    memcpy( (rtp_packet + 12 + 4), data, datan );
 
     /// send RTP over TCP
-    if( 0 != ezrtp_packet_send( c->fd, rtp_packet, 4 + 12 + size ) ) {
+    if( 0 != ezrtp_packet_send( c->fd, rtp_packet, 4 + 12 + datan ) ) {
         return -1;
     }
     c->rtp_seq += 1;
     return 0;
 }
 
-int ezrtp_fu_264( rtsp_con_t * c, int payload, char * nal, int len, int mark, unsigned long long ts )
+int ezrtp_fu_264( rtsp_con_t * c, int payload, char * nal, int naln, int mark, unsigned long long ts )
 {
     int ret = 0;
     char * fua = NULL;
     char pkt[1500] = {0};
     int pktlen = 0;
 
+    /// fill in  2 byte 
     pkt[0] = 28 | ( nal[0] & 0xe0 );
     pkt[1] = 0x80 | (nal[0] & 0x1f );
 
-    /// skip nal hdr 
+    /// skip nalu header 
     fua = nal+1;
-    len -= 1;
+    naln -= 1;
 
-    while( (len + 2) > 1462 ) {
-        pktlen = 1462 - 2;
+    while( (naln + 2) > RTP_MSS ) {
+        pktlen = RTP_MSS - 2;
         memcpy( &pkt[2], fua, pktlen );
         
-        if( ( ret = ezrtp_packet_build( c, payload, pkt, 1462, 0, ts ) ) < 0 ) {
+        if( ( ret = ezrtp_packet_build( c, payload, pkt, RTP_MSS, 0, ts ) ) < 0 ) {
             return ret;
         }
 
         fua += pktlen;
-        len -= pktlen;
+        naln -= pktlen;
         pkt[1] &= ~0x80;
     }
     pkt[1]  |= 0x40;
-    memcpy( &pkt[2], fua, len );
-    return ezrtp_packet_build(c, payload, pkt, (len+2), 1, ts );
+    memcpy( &pkt[2], fua, naln );
+    return ezrtp_packet_build(c, payload, pkt, (naln+2), 1, ts );
 }
 
 int ezrtp_fu_265( rtsp_con_t * c, int payload, char * nal, int len, int mark, unsigned long long ts )
@@ -438,12 +464,11 @@ int ezrtp_fu_265( rtsp_con_t * c, int payload, char * nal, int len, int mark, un
     len -= 2;
 
     /// devide H265 data to small pieces and send 
-    while( (len + 3) > 1462 ) {
-        // dbg("len [%d]\n", len );
-        pktlen = 1462 - 3;
+    while( (len + 3) > RTP_MSS ) {
+        pktlen = RTP_MSS - 3;
         memcpy( &pkt[3], fua, pktlen );
 
-        if( ( ret = ezrtp_packet_build( c, payload, pkt, 1462, 0, ts ) ) < 0 ) {
+        if( ( ret = ezrtp_packet_build( c, payload, pkt, RTP_MSS, 0, ts ) ) < 0 ) {
             return ret;
         }
         
@@ -466,7 +491,7 @@ int ezrtp_send_frame( rtsp_con_t * c, char * frame_data, int frame_len, unsigned
     const char * end = p + frame_len;
     const char * nal_start = NULL, *nal_end = NULL;
 
-    ts = 90000*ts/1000;
+    
 
     /// 1.frist find nal uint form frame data.
     nal_start = ffmpeg_find_nal_uint( p, end );
@@ -483,17 +508,15 @@ int ezrtp_send_frame( rtsp_con_t * c, char * frame_data, int frame_len, unsigned
         
         /// 2. pack nal uint to rtp format with different way  
 
-        /// if nal uint length < mtu
-        /// send rtp with single nal uint 
-        if( nlen <= 1462 ) {
+        /// if nal uint length <= MSS, send rtp with single nal uint
+        if( nlen <= RTP_MSS ) {
             if( video_get_enctype() == 0 ) {
                 ret = ezrtp_packet_build( c, 96, (char*)nal_start, nlen, (end > nal_end) ? 0 : 1, ts );
             } else {
                 ret = ezrtp_packet_build( c, 97, (char*)nal_start, nlen, (end > nal_end) ? 0 : 1, ts );
             }
         } else {
-            /// if nal uint length > mtu
-            /// goto rtp send with fragmentation uint
+            /// if nal uint length > MSS 
             if( video_get_enctype() == 0 ) {
                 ret = ezrtp_fu_264( c, 96, (char*)nal_start, nlen, (end > nal_end) ? 0 : 1, ts );
             } else {
@@ -514,16 +537,28 @@ int ezrtp_send_frame( rtsp_con_t * c, char * frame_data, int frame_len, unsigned
 
 int ezrtsp_con_alloc( rtsp_con_t ** c )
 {
-    rtsp_con_t * n = sys_alloc(sizeof(rtsp_con_t) );
-    if( !n ) {
-        err("rtsp con alloc failed. [%d] [%s]\n", errno, strerror(errno) );
-        return -1;
+    int i = 0;
+    int find = 0;
+    
+    for( i = 0; i < 8; i ++ ) {
+        if( !con_arr[i].use ) {
+            find = 1;
+            break;
+        }
     }
-	n->start = n->pos = n->last = n->buffer;
-	n->end = n->start + sizeof(n->buffer);
 
-    *c = n;
-    return 0;
+    if( !find ) {
+        err("rtsp con full\n");
+        return -1;
+    } else {
+        rtsp_con_t * con = &con_arr[i];
+        con->use = 1;
+        con->start = con->pos = con->last = con->buffer;
+        con->end = con->start + sizeof(con->buffer);
+
+        *c = con;
+        return 0;
+    }
 }
 
 void ezrtsp_con_free( rtsp_con_t * c )
@@ -539,8 +574,7 @@ void ezrtsp_con_free( rtsp_con_t * c )
             evt_opt( c->ev, c->fd, NULL, NULL, EV_NONE );
 			close(c->fd);
 		}	
-        queue_remove( &c->queue );
-		sys_free(c);
+        memset( c, 0, sizeof(rtsp_con_t) );
 	}	
 }
 
@@ -555,7 +589,6 @@ void ezrtsp_resp_send( evt_obj_t * ev, int trigger_type )
     int sent = 0;
     rtsp_con_t * c = (rtsp_con_t *)ev->ext_data;
     assert( c != NULL );
-    dbg("\n");
     while( c->pos < c->last ) {
         sent = send( c->fd, c->pos, c->last - c->pos, 0 );
         if( sent <= 0 ) {
@@ -609,108 +642,69 @@ int ezrtsp_resp_sdp( int chn, char * str )
 	return 0;
 }
 
-static void * ezrtp_send_task_sub(  void * param )
+static void * ezrtp_send_task( )
 {
-    SET_THREAD_NAME("hm2p_ezrtp_sub");
+    SET_THREAD_NAME("hm2p_ezrtp");
 
-    long long chn_seq = -1;
+    long long chn_seq[2] = {-1};
+    int chn = 0;
+    unsigned long long ts[2] = {0};
+    
+    int i = 0;
+    rtsp_con_t * con = NULL;
+    int playn = 0;
 
     while( ez_rtp_stat == 1 ) {
-        if( queue_empty(&g_queue_con) ) {
-            chn_seq = -1;
+
+        /// get rtsp connection playing count 
+        playn = 0;
+        for( i = 0; i < 8; i ++ ) {
+            con = &con_arr[i];
+            if( con->use && con->play ) {
+                playn ++;
+            }
+        }
+        /// have't playing connection do nothing 
+        if( playn < 1 ) {
+            chn_seq[0] = chn_seq[1] = -1;
             sys_msleep(100);
             continue;
         }
 
-        if( chn_seq == -1 ) {
-            chn_seq = ezcache_last_idr( 1 );
-            if( chn_seq == -1 ) {
-                sys_msleep(10);
-                continue;
-            }
-        }
-
-        ezcache_frm_t * frm = ezcache_frm_get( 1, chn_seq++ );
-        if( frm ) {
-            queue_t * q = queue_head( &g_queue_con );
-            queue_t * n = NULL;
-            
-            while( q != queue_tail(&g_queue_con) ) {
-                n = queue_next(q);
-
-                rtsp_con_t * c = ptr_get_struct( q, rtsp_con_t, queue);
-                if(c->chn == 1) {
-                    if( 0 != ezrtp_send_frame( c, (char*)frm->data, frm->datan, frm->ts ) ) {
-                        err("ezrtszsp con send rtp packet failed\n");
-                        ezrtsp_con_free(c);
-                        queue_remove(q);
+        /// get frame from sys cache and goto send to rtsp client 
+        for( chn = 0; chn < 2; chn ++ ) {
+            if( chn_seq[chn] == -1 ) {
+                chn_seq[chn] = ezcache_last_idr(chn);
+                sys_msleep(5);
+            } else {
+                ezcache_frm_t * frm = ezcache_frm_get( chn, chn_seq[chn] );
+                if (frm) {
+                     
+                    for( i = 0; i < 8; i ++ ) {
+                        con = &con_arr[i];
+                        if( con->use && con->play && con->chn == chn ) {
+                            ///if( 0 != ezrtp_send_frame( con, (char*)frm->data, frm->datan, 90000*frm->ts/1000 ) ) {
+                            if( 0 != ezrtp_send_frame( con, (char*)frm->data, frm->datan, ts[chn] ) ) {
+                                err("ezrtsp con send rtp packet failed\n");
+                                /// continue send. do nothing 
+                            }
+                        }
                     }
+
+                    sys_free(frm);
+                    chn_seq[chn]++;
+                    ts[chn] += 90000/video_get_fps(chn);
+                    
+                } else {
+                    sys_msleep(5);
                 }
-                q = n;
             }
-            sys_free(frm);
-        } else {
-            chn_seq --;
-            sys_msleep(5);
         }
     }
 
     return NULL;
 }
 
-static void * ezrtp_send_task( void * para )
-{
-    SET_THREAD_NAME("hm2p_ezrtp_main");
-
-    long long chn_seq = -1;
-
-    while( ez_rtp_stat == 1 ) {
-
-        /// rtsp conection queue empty. do nothing
-        if( queue_empty(&g_queue_con) ) {
-            chn_seq = -1;
-            sys_msleep(100);
-            continue;
-        }
-
-        /// seq init 
-        if( chn_seq == -1 ) {
-            chn_seq = ezcache_last_idr( 0 );
-            if( chn_seq == -1 ) {
-                sys_msleep(10);
-                continue;
-            }
-        }
-
-        /// get frame form cache -> send frame to each rtsp connection
-        ezcache_frm_t * frm = ezcache_frm_get( 0, chn_seq++ );
-        if( frm ) {
-            queue_t * q = queue_head( &g_queue_con );
-            queue_t * n = NULL;
-            
-            while( q != queue_tail(&g_queue_con) ) {
-                n = queue_next(q);
-
-                rtsp_con_t * c = ptr_get_struct( q, rtsp_con_t, queue);
-                if(c->chn == 0) {
-                    if( 0 != ezrtp_send_frame( c, (char*)frm->data, frm->datan, frm->ts ) ) {
-                        err("ezrtszsp con send rtp packet failed\n");
-                        ezrtsp_con_free(c);
-                        queue_remove(q);
-                    }
-                }
-                q = n;
-            }
-            /// must do this after call ezcache_frm_get();
-            sys_free(frm);
-        } else {
-            chn_seq --;
-            sys_msleep(5);
-        }
-    }
-
-    return NULL;
-}
 
 void ezrtsp_resp( evt_obj_t * ev, int trigger_type )
 {
@@ -724,7 +718,7 @@ void ezrtsp_resp( evt_obj_t * ev, int trigger_type )
 
     /// reset buffer
     memset( c->buffer, 0, sizeof(c->buffer) );
-    c->start = c->pos = c->last = c->buffer;
+   c->start = c->pos = c->last = c->buffer;
     c->end = c->start + sizeof(c->buffer);
     
     if( c->req_method ==  METHOD_OPTIONS ) {
@@ -834,19 +828,16 @@ void ezrtsp_resp( evt_obj_t * ev, int trigger_type )
         );
         // request play process
         // 1. return 200 OK RTSP response
-        // 2. start a task to send video stream form sys cache 
+        // 2. start a task to send video stream form sys cache if task not running 
         // 3. delete timer for the connection
-        // 4. clear the meta, when recvid data
+        // 4. set rtsp connection play flag 
 
         c->play = 1;
         evt_timer_del( evt_find( c->ev, c->fd ) );
-        queue_init( &c->queue );
-        queue_insert_tail( &g_queue_con, &c->queue );
         
         if( ez_rtp_stat != 1 ) {
             ez_rtp_stat = 1;
             pthread_create( &ez_rtp_task_pid, NULL, &ezrtp_send_task, NULL );
-            pthread_create( &ez_rtp_task_pid_sub, NULL, &ezrtp_send_task_sub, NULL );
         }
 
     }
@@ -865,7 +856,7 @@ void ezrtsp_process_request( evt_obj_t * ev, int trigger_type )
         
 		recvd = recv( c->fd, c->last, c->end - c->last, 0 );
 		if( recvd <= 0 ) {
-			if( recvd == 0 )  {
+			if( recvd == 0 ) {
 				err("rtsp con peer closed, free rtsp con\n");
 				return ezrtsp_con_free( c );
 			}			
@@ -873,7 +864,7 @@ void ezrtsp_process_request( evt_obj_t * ev, int trigger_type )
 
                 if( c->play == 1 ) {
                     evt_timer_del( ev );
-                    dbg("recv EAGAIN. (but connection in sending.)\n");
+                    dbg("ignore EAGAIN. (rtp sending...)\n");
                     /// reset the meta
                     memset( c->buffer, 0, sizeof(c->buffer) );
                     c->start = c->pos = c->last = c->buffer;
@@ -888,7 +879,7 @@ void ezrtsp_process_request( evt_obj_t * ev, int trigger_type )
 			}
 		}
 		c->last += recvd;
-        // dbg("recvd len [%d]\n", recvd );
+        ///dbg("recvd len [%d] raw [%s]\n", recvd, c->pos );
 	
         /// find finish mark
 		p = strstr( c->pos, "\r\n\r\n" );
@@ -946,9 +937,9 @@ void ezrtsp_accept( evt_obj_t * ev, int trigger_type )
     /// need run loop accept in here. listen fd is non blocking 
 
     while(1) {
-        socklen_t len = 0;
+        socklen_t len = sizeof( struct sockaddr_in );
         struct sockaddr_in caddr;
-        memset( &caddr, 0, sizeof(struct sockaddr_in) );
+        memset( &caddr, 0, len );
         cfd = accept( ev->fd, (struct sockaddr*)&caddr, &len );
         if( cfd == -1 ) {
             err("ezrtsp accept cli failed. [%d]\n", errno );
@@ -966,7 +957,8 @@ void ezrtsp_accept( evt_obj_t * ev, int trigger_type )
         int nbio = 1;
         ioctl( cfd, FIONBIO, &nbio );
 
-        strncpy( c->client_ip, inet_ntoa(caddr.sin_addr), sizeof(c->client_ip) );
+        memset( c->client_ip, 0, sizeof(c->client_ip) );
+        strcpy( c->client_ip, inet_ntoa(caddr.sin_addr) );
         dbg("ezrtsp accept new cli. addr [%p] fd [%d] ip [%s]\n", c, c->fd, c->client_ip );
         
         evt_opt( ev->evt, c->fd, (void*)c, ezrtsp_process_request, EV_R );
@@ -1032,7 +1024,6 @@ int ezrtsp_start(  )
         }
 
         dbg("ezrtsp serv listen on port:[%d]\n", EZRTSP_PORT );
-        queue_init( &g_queue_con );
         ret = 0;
     } while(0);
 
@@ -1041,6 +1032,12 @@ int ezrtsp_start(  )
         if( g_listen_fd > 0 ) {
             close(g_listen_fd);
         }
+        return -1;
+    }
+
+    con_arr = sys_alloc( 8 * sizeof(rtsp_con_t) );
+    if( !con_arr ) {
+        err("alloc con arr failed, [%d]\n", errno );
         return -1;
     }
 
@@ -1058,13 +1055,17 @@ int ezrtsp_stop( )
 {
     if( ez_rtp_stat == 1 ) {
         ez_rtp_stat = 0;
-        pthread_join( ez_rtp_task_pid, NULL );
-        pthread_join( ez_rtp_task_pid_sub, NULL );
+        pthread_join( ez_rtp_task_pid, NULL );    
     }
 
     if( ez_rtsp_stat & EZRTSP_INIT ) {
         ez_rtsp_stat &= ~EZRTSP_INIT;
         pthread_join( ez_rtsp_task_pid, NULL );
+    }
+
+    if( con_arr ) {
+        sys_free(con_arr);
+        con_arr = NULL;
     }
     return 0;
 }
