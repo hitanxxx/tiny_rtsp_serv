@@ -82,7 +82,6 @@ typedef struct conn
     /// PTS record 
     int         rtp_seq;
     int         rtp_ts;
-    unsigned long long rtp_ts_frist;
 } rtsp_con_t;
 
 static int g_listen_fd = 0;
@@ -386,9 +385,6 @@ int ezrtp_packet_build( rtsp_con_t * c, int payload, const char * data, int data
         PUT_16( rtp_packet + 2, (12 + datan) );    // rtp data length
     }
 
-    if( c->rtp_ts_frist == 0 ) {
-        c->rtp_ts_frist = ts;
-    }    
 
     /// RTP header 
     char * rtp_hdr = NULL;
@@ -396,7 +392,6 @@ int ezrtp_packet_build( rtsp_con_t * c, int payload, const char * data, int data
     rtp_hdr[0] = 2 << 6;   // fixeds
     rtp_hdr[1] = (payload &0x7f) | ((marker&0x01)<<7); // fixed
     PUT_16( rtp_hdr + 2, c->rtp_seq );  /// sequence
-    //PUT_32( rtp_hdr + 4, ts - c->rtp_ts_frist ); // PTS
     PUT_32( rtp_hdr + 4, ts ); // PTS
     PUT_32( rtp_hdr + 8, 0x252525 );  /// SSRC
 
@@ -585,6 +580,16 @@ int ezrtsp_con_alloc( rtsp_con_t ** c )
         con->start = con->pos = con->last = con->buffer;
         con->end = con->start + sizeof(con->buffer);
 
+        memset( con->client_ip, 0, sizeof(con->client_ip) );
+        con->req_complete = 0;
+        con->req_cseq = 0;
+        con->req_method = 0;
+        con->req_setup_tcp = 0;
+
+        con->chn = 0;
+        con->rtp_seq = 0;
+        con->rtp_ts = 0;
+
         *c = con;
         return 0;
     }
@@ -677,7 +682,6 @@ static void * ezrtp_send_task( )
 
     long long chn_seq[2] = {-1};
     int chn = 0;
-    unsigned long long ts[2] = {0};
     
     int i = 0;
     rtsp_con_t * con = NULL;
@@ -713,14 +717,14 @@ static void * ezrtp_send_task( )
                         con = &con_arr[i];
                         if( con->use && con->play && con->chn == chn ) {
                             if( frm->typ == 0 ) {
-                                if( 0 != ezrtp_send_audio_frame( con, (char*)frm->data, frm->datan, ts[chn] ) ) {
+                                if( 0 != ezrtp_send_audio_frame( con, (char*)frm->data, frm->datan, con->rtp_ts ) ) {
                                     err("ezrtsp con send audio rtp packet failed\n");
                                     ///do nothing
                                 }
                             } else {
                                 ///video frame send 
                                 ///if( 0 != ezrtp_send_video_frame( con, (char*)frm->data, frm->datan, 90000*frm->ts/1000 ) ) {
-                                if( 0 != ezrtp_send_video_frame( con, (char*)frm->data, frm->datan, ts[chn] ) ) {
+                                if( 0 != ezrtp_send_video_frame( con, (char*)frm->data, frm->datan, con->rtp_ts ) ) {
                                     err("ezrtsp con send video rtp packet failed\n");
                                     ///do nothing 
                                 }
@@ -730,7 +734,7 @@ static void * ezrtp_send_task( )
 
                     sys_free(frm);
                     chn_seq[chn]++;
-                    ts[chn] += 90000/video_get_fps(chn);
+                    con->rtp_ts += 90000/video_get_fps(chn);
                     
                 } else {
                     sys_msleep(5);
