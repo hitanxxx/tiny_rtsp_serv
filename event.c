@@ -36,47 +36,43 @@
 #include <pthread.h>
 #include <sys/socket.h>
 
-
 #include "HM2P_Common.h"
 #include "HM2P_Network.h"
 #include "event.h"
 
-
-
-/// @brief delete the timer of fd
-/// @param ev 
-void inline evt_timer_del( evt_obj_t * ev )
+ev_t * ev_find( ev_ctx_t * ctx, int fd )
 {
-    ev->timeout_cb = NULL;
-    ev->timeout_ts = 0;
-    return;
-}
-
-/// @brief add the timer of fd 
-/// @param ev 
-/// @param timeout_cb 
-/// @param msec 
-void evt_timer_add( evt_obj_t * ev, evt_timeout_cb timeout_cb, int msec )
-{
-    ev->timeout_cb = timeout_cb;
-    ev->timeout_ts = sys_ts_msec() + msec;
-    return;
-}
-
-
-evt_obj_t * evt_find( evt_t * evt, int fd )
-{
-    evt_obj_t * ev_obj = NULL;
-    queue_t * q = queue_head( &evt->queue );
-    for( ; q != queue_tail(&evt->queue); q = queue_next(q) ) {
-        ev_obj = ptr_get_struct( q, evt_obj_t, queue);
-        if( ev_obj->fd == fd ) {
-            return ev_obj;
+    ev_t * ev = NULL;
+    queue_t * q = queue_head( &ctx->queue );
+    for( ; q != queue_tail(&ctx->queue); q = queue_next(q) ) {
+        ev = ptr_get_struct( q, ev_t, queue);
+        if( ev->fd == fd ) {
+            return ev;
         }
     }
     return NULL;
 }
 
+void ev_timer_del( ev_ctx_t * ctx, int fd )
+{
+    ev_t * ev = ev_find(ctx, fd);
+    if(ev) {
+    	ev->exp_cb = NULL;
+	    ev->exp_ts = 0;
+    }
+    return;
+}
+
+void ev_timer_add( ev_ctx_t * ctx, int fd, void * user_data, ev_exp_cb cb, int delay_msec )
+{
+    ev_t * ev = ev_find(ctx, fd);
+    if(ev) {
+    	ev->ext_data = user_data;
+	    ev->exp_cb = cb;
+	    ev->exp_ts = sys_ts_msec() + delay_msec;
+    }
+    return;
+}
 
 /// @brief add/del/mode fd with evt mgr  
 /// @param evt [IN] evt mgr
@@ -84,171 +80,147 @@ evt_obj_t * evt_find( evt_t * evt, int fd )
 /// @param ext [IN] fd extra data
 /// @param cb [IN] fd callbacks
 /// @param want_opt [IN] want trigger type
-void evt_opt( evt_t * evt, int fd, void * ext, evt_cb cb, int want_opt )
+void ev_opt( ev_ctx_t * ctx, int fd, void * user_data, ev_cb cb, int op )
 {
     /// some assert
     assert( fd >= 0 );
-    assert( evt != NULL );
-    assert( want_opt <= EV_RW );
-    assert( want_opt >= EV_NONE );
+    assert( ctx != NULL );
+    assert( op <= EV_RW );
+    assert( op >= EV_NONE );
 
     /// find the fd form ev obj
-    evt_obj_t * ev_obj = evt_find(evt, fd);    
-    if( ev_obj ) {
-        
-        ev_obj->cb = cb;
-        ev_obj->ext_data = ext;
+    ev_t * ev = ev_find(ctx, fd);    
+    if( ev ) {
+        ev->cb = cb;
+        ev->ext_data = user_data;
     
-        if( ev_obj->opt != want_opt ) {
-
-            /// type changed. clear timer 
-            ev_obj->timeout_ts = 0;
-            ev_obj->timeout_cb = NULL;
-
-            if( want_opt == EV_NONE ) {
-                ev_obj->active = 0;
-                FD_CLR( fd, &evt->cache_rfds);
-                FD_CLR( fd, &evt->cache_wfds);
-            } else if ( want_opt == EV_RW ) {
-                ev_obj->active = 1;
-                FD_SET( fd, &evt->cache_rfds );
-                FD_SET( fd, &evt->cache_wfds );
-            } else if ( want_opt == EV_R) {
-                ev_obj->active = 1;
-                FD_CLR( fd, &evt->cache_wfds );
-                FD_SET( fd, &evt->cache_rfds );
-            } else if ( want_opt == EV_W ) {
-                ev_obj->active = 1;
-                FD_CLR( fd, &evt->cache_rfds);
-                FD_SET( fd, &evt->cache_wfds);
+        if( ev->op != op ) {
+            if( op == EV_NONE ) {
+                ev->active = 0;
+                FD_CLR( fd, &ctx->cache_rfds);
+                FD_CLR( fd, &ctx->cache_wfds);
+            } else if ( op == EV_RW ) {
+                ev->active = 1;
+                FD_SET( fd, &ctx->cache_rfds );
+                FD_SET( fd, &ctx->cache_wfds );
+            } else if ( op == EV_R) {
+                ev->active = 1;
+                FD_CLR( fd, &ctx->cache_wfds );
+                FD_SET( fd, &ctx->cache_rfds );
+            } else if ( op == EV_W ) {
+                ev->active = 1;
+                FD_CLR( fd, &ctx->cache_rfds);
+                FD_SET( fd, &ctx->cache_wfds);
             }
-            ev_obj->opt = want_opt;
+            ev->op = op;
         }
     } else {
         /// ev_obj not find 
-        if( want_opt == EV_NONE ) {
-            /// do nothing 
-        } else {
-            ev_obj = sys_alloc(sizeof(evt_obj_t));
-            if( !ev_obj ) {
-                err("alloc ev obj fialed. [%d] [%s]\n", errno, strerror(errno));
+        if( op != EV_NONE ) {
+            ev = sys_alloc(sizeof(ev_t));
+            if( !ev ) {
+                err("ev alloc fialed. [%d] [%s]\n", errno, strerror(errno));
                 return;
             }
-            ev_obj->fd = fd;
-            ev_obj->cb = cb;
-            ev_obj->timeout_ts = 0;
-            ev_obj->timeout_cb = NULL;
-            ev_obj->ext_data = ext;
-            ev_obj->evt = evt;
-            
-            queue_insert_tail( &evt->queue, &ev_obj->queue );
-        
-            if ( want_opt == EV_RW ) {
-                ev_obj->active = 1;
-                FD_SET( fd, &evt->cache_rfds );
-                FD_SET( fd, &evt->cache_wfds );
-            } else if ( want_opt == EV_R) {
-                ev_obj->active = 1;
-                FD_CLR( fd, &evt->cache_wfds );
-                FD_SET( fd, &evt->cache_rfds );
-            } else if ( want_opt == EV_W ) {
-                ev_obj->active = 1;
-                FD_CLR( fd, &evt->cache_rfds);
-                FD_SET( fd, &evt->cache_wfds);
+            ev->fd = fd;
+            ev->cb = cb;
+            ev->exp_ts = 0;
+            ev->exp_cb = NULL;
+            ev->ext_data = user_data;
+            ev->ctx = ctx;
+            queue_insert_tail( &ctx->queue, &ev->queue );
+        	
+	    ev->active = 1;
+            if ( op == EV_RW ) {
+                FD_SET( fd, &ctx->cache_rfds );
+                FD_SET( fd, &ctx->cache_wfds );
+            } else if ( op == EV_R) {
+                FD_CLR( fd, &ctx->cache_wfds );
+                FD_SET( fd, &ctx->cache_rfds );
+            } else if ( op == EV_W ) {
+                FD_CLR( fd, &ctx->cache_rfds);
+                FD_SET( fd, &ctx->cache_wfds);
             }
-            ev_obj->opt = want_opt;
+            ev->op = op;
         }
     }
     return;
 }
 
-void evt_loop( evt_t * evt )
+void ev_loop( ev_ctx_t * ctx )
 {
     /*
-    current use round-robin method to check fd actions
-    round-robin timeout is 50 msecond
+    	round-robin check actions
     */
     int max_fd = -1;
     int actall = 0;
-    unsigned long long abs_cur_msec = sys_ts_msec();
+    unsigned long long cur_msec = sys_ts_msec();
 
     fd_set rfds;
     fd_set wfds;
 
-    /// /// timer degree : 50 msecond
-    struct timeval select_interval;
-    memset( &select_interval, 0, sizeof(struct timeval) );
-    select_interval.tv_sec	= 0;
-    select_interval.tv_usec = 50 * 1000;        
+    ///timer degree : 88 msecond
+    struct timeval ts;
+    memset( &ts, 0, sizeof(ts) );
+    ts.tv_sec = 0;
+    ts.tv_usec = 88 * 1000; 
   
-    evt_obj_t * ev_obj = NULL;
-    queue_t * q = queue_head( &evt->queue );
-    for( ; q != queue_tail(&evt->queue); q = queue_next(q) ) {
-        ev_obj = ptr_get_struct( q, evt_obj_t, queue);
-        if( (ev_obj->fd > 0) && (ev_obj->fd > max_fd) ) {
-            max_fd = ev_obj->fd;
+    ev_t * ev = NULL;
+    queue_t * q = queue_head( &ctx->queue );
+    for( ; q != queue_tail(&ctx->queue); q = queue_next(q) ) {
+        ev = ptr_get_struct( q, ev_t, queue);
+        if( ev->active && (ev->fd > max_fd) ) {
+            max_fd = ev->fd;
         }
 
-        if( ev_obj->timeout_ts > 0 ) {
-            if( abs_cur_msec >= ev_obj->timeout_ts ) {
-                dbg("ev fd [%d] timeout\n", ev_obj->fd );
-                if( ev_obj->timeout_cb ) {
-                    ev_obj->timeout_cb( ev_obj );
-                }
-                ev_obj->timeout_ts = 0;
+        if( ev->exp_ts > 0 ) {
+            if( cur_msec >= ev->exp_ts ) {
+                dbg("ev fd [%d] timeout\n", ev->fd );
+                if( ev->exp_cb ) ev->exp_cb( ctx, ev->fd, ev->ext_data );
+                ev->exp_ts = 0;
             }
         }
     }
 
-    memcpy( &rfds, &evt->cache_rfds, sizeof(fd_set) );
-    memcpy( &wfds, &evt->cache_wfds, sizeof(fd_set) );
+    memcpy( &rfds, &ctx->cache_rfds, sizeof(fd_set) );
+    memcpy( &wfds, &ctx->cache_wfds, sizeof(fd_set) );
 
-    actall = select( max_fd + 1, &rfds, &wfds, NULL, &select_interval );
-    if( actall <= 0 ) {
-        //if( ret == 0 ) err("select timeout\n");
-        return;
+    actall = select( max_fd + 1, &rfds, &wfds, NULL, &ts );
+    if( actall < 0 ) {
+    	err("ev select failed. [%d]\n", errno );
+	return;
+    } else if (actall == 0 ) {
+	///timeout. do nothing
+	return;
     } else {
-
         int actn = 0;
-        evt_obj_t * ev_obj = NULL;
-        queue_t * q = queue_head( &evt->queue );
-        for( ; q != queue_tail(&evt->queue); q = queue_next(q) ) {
-            ev_obj = ptr_get_struct( q, evt_obj_t, queue);
-            
-            int typ = 0;
-            if( !ev_obj->active ) {
-                continue;
-            }
-            if( FD_ISSET( ev_obj->fd, &rfds ) ) {
-                typ |= EV_R;
-            }
-            if( FD_ISSET( ev_obj->fd, &wfds ) ) {
-                typ |= EV_W;
-            }
-            if( typ > 0 ) {
-                if( ev_obj->cb ) {
-                    ev_obj->cb(ev_obj, typ);
-                }
-                actn ++;
-                if( actn >= actall ) {
-                    break;
-                }
-            }
-        }
 
-        /// !!! important: clear the no active obj in loop
-        q = queue_head( &evt->queue );
+        queue_t * q = queue_head( &ctx->queue );
         queue_t * n = NULL;
-        while( q != queue_tail(&evt->queue) ) {
+        while( q != queue_tail(&ctx->queue) ) {
             n = queue_next(q);
 
-            ev_obj = ptr_get_struct( q, evt_obj_t, queue);
-            if( !ev_obj->active ) {
-                dbg("evobj fd [%d] no active. free\n", ev_obj->fd );
+            ev_t * ev = ptr_get_struct( q, ev_t, queue);
+            if( !ev->active ) {
+                dbg("ev fd [%d] disactive.\n", ev->fd );
                 queue_remove(q);
-                sys_free(ev_obj);
+                sys_free(ev);
+            } else {
+                int rw = 0;
+                if( FD_ISSET( ev->fd, &rfds ) ) {
+                    rw |= EV_R;
+                }
+                if( FD_ISSET( ev->fd, &wfds ) ) {
+                    rw |= EV_W;
+                }
+                if( rw > 0 ) {
+                    if( ev->cb ) ev->cb( ctx, ev->fd, ev->ext_data, rw);
+                    actn++;
+                    if( actn >= actall ) {
+                        break;
+                    }
+                }
             }
-            
             q = n;
         }
     }
@@ -258,34 +230,29 @@ void evt_loop( evt_t * evt )
 /// @brief create a evt mgr 
 /// @param evt [IN]
 /// @return 
-int evt_create( evt_t ** evt )
+int ev_create( ev_ctx_t ** ctx )
 {
-    evt_t * n_evt = sys_alloc(sizeof(evt_t) );
-    if( !n_evt ) {
-        err("alloc evt failed. [%d]\n", errno );
+    ev_ctx_t * nctx = sys_alloc(sizeof(ev_ctx_t));
+    if( !nctx ) {
+        err("ev ctx alloc failed. [%d]\n", errno );
         return -1;
     }
 
-    FD_ZERO(&n_evt->cache_rfds);
-    FD_ZERO(&n_evt->cache_wfds);
-    queue_init( &n_evt->queue );
-    
-    *evt = n_evt;
+    FD_ZERO(&nctx->cache_rfds);
+    FD_ZERO(&nctx->cache_wfds);
+    queue_init( &nctx->queue );
+    *ctx = nctx;
     return 0;
 }
 
 /// @brief free a evt mgr
 /// @param evt 
-void evt_free( evt_t * evt )
+void ev_free( ev_ctx_t * ctx )
 {
-    if ( evt ) {
-        /// clear fdset 
-        FD_ZERO( &evt->cache_rfds );
-        FD_ZERO( &evt->cache_wfds );
-
-        /// transverl the queue and clear it 
-        sys_free(evt);
-        evt = NULL;
+    if ( ctx ) {
+        FD_ZERO( &ctx->cache_rfds );
+        FD_ZERO( &ctx->cache_wfds );
+        sys_free(ctx);
     }
 }
 
