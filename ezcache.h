@@ -3,7 +3,6 @@
 
 #include "HM2P_Common.h"
 
-
 enum {
     SYS_CACHE_VIDEO_MAIN = 0,
     SYS_CACHE_VIDEO_SUB,
@@ -24,15 +23,11 @@ typedef struct ezcache_frm_s
 } ezcache_frm_t;
 
 
-
-
-int ezcache_exit( int channel_id );
-
-
-int ezcache_frm_add( int channel_id, char * data, int datan, int typ, unsigned long long ts );
-ezcache_frm_t * ezcache_frm_get( int channel_id, long long seq );
-long long ezcache_last_idr( int channel_id );
-long long ezcache_prev_idr( int channel_id, long long seq );
+int ezcache_exit(int channel_id);
+int ezcache_frm_add(int channel_id, char * data, int datan, int typ, unsigned long long ts);
+ezcache_frm_t * ezcache_frm_get(int channel_id, long long seq);
+long long ezcache_last_idr(int channel_id);
+long long ezcache_prev_idr(int channel_id, long long seq);
 
 #endif
 
