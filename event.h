@@ -14,8 +14,8 @@
 typedef struct ev_ctx_t ev_ctx_t;
 typedef struct ev_t ev_t;
 
-typedef void ( * ev_cb ) ( ev_ctx_t * ctx, int fd, void * user_data, int rw );
-typedef void ( * ev_exp_cb ) ( ev_ctx_t * ctx, int fd, void * user_data );
+typedef void (*ev_cb) (ev_ctx_t * ctx, int fd, void * user_data, int rw);
+typedef void (*ev_exp_cb) (ev_ctx_t * ctx, int fd, void * user_data);
 
 /// @brief evt obj data
 struct ev_t
@@ -42,15 +42,15 @@ struct ev_ctx_t
 };
 
 /// evt api
-void ev_timer_add( ev_ctx_t * ctx, int fd, void * user_data, ev_exp_cb cb, int delay_msec );
-void ev_timer_del( ev_ctx_t * ctx, int fd );
+void ev_timer_add(ev_ctx_t * ctx, int fd, void * user_data, ev_exp_cb cb, int delay_msec);
+void ev_timer_del(ev_ctx_t * ctx, int fd);
 
-int ev_create( ev_ctx_t ** ev_ctx );
-void ev_free( ev_ctx_t * evt );
-void ev_loop( ev_ctx_t * evt );
+int ev_create(ev_ctx_t ** ev_ctx);
+void ev_free(ev_ctx_t * evt);
+void ev_loop(ev_ctx_t * evt);
 
-void ev_opt( ev_ctx_t * ctx, int fd, void * user_data, ev_cb cb, int rw );
-ev_t * ev_find( ev_ctx_t * ctx, int fd );
+void ev_opt(ev_ctx_t * ctx, int fd, void * user_data, ev_cb cb, int rw);
+ev_t * ev_find(ev_ctx_t * ctx, int fd);
 
 #endif
 
